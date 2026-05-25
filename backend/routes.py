@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from database import get_db, Repository, PullRequest, PRFile, AIReviewIssue, ReviewSummary
 import ai_engine
 from ai_engine import SIMULATED_STEPS, run_actual_review_engine, client as openai_client
+from app.services.github_client import GitHubClient
 
 router = APIRouter(prefix="/api", tags=["api"])
 
@@ -87,144 +88,115 @@ def apply_suggestion_patch(original_content: str, patch_diff: str) -> str:
 
     return original_content
 
-# GitHub PR Fetcher helper
-# GitHub PR Fetcher helper (Synchronous)
-def onboard_github_pr(owner: str, repo_name: str, number: int, db: Session) -> PullRequest:
-    token = os.getenv("GITHUB_TOKEN")
-    headers = {
-        "Accept": "application/vnd.github.v3+json",
-        "User-Agent": "CodePilot-AI-Engine"
-    }
-    if token:
-        headers["Authorization"] = f"token {token}"
+# GitHub PR Fetcher helper (Synchronous using GitHubClient)
+def onboard_github_pr(owner: str, repo_name: str, number: int, db: Session, token: Optional[str] = None) -> PullRequest:
+    gh_client = GitHubClient(token=token)
 
-    with httpx.Client(timeout=20.0) as http_client:
-        # 1. Fetch Pull Request metadata
-        pr_url = f"https://api.github.com/repos/{owner}/{repo_name}/pulls/{number}"
+    # 1. Fetch Pull Request metadata
+    pr_url = f"https://api.github.com/repos/{owner}/{repo_name}/pulls/{number}"
+    pr_res = gh_client.get(pr_url)
+    pr_data = pr_res.json()
+
+    # 2. Fetch Pull Request files list
+    files_url = f"https://api.github.com/repos/{owner}/{repo_name}/pulls/{number}/files"
+    try:
+        files_res = gh_client.get(files_url)
+        files_data = files_res.json() if files_res.status_code == 200 else []
+    except Exception:
+        files_data = []
+
+    # 3. Create/Retrieve Repository record
+    repo = db.query(Repository).filter(Repository.name == repo_name, Repository.owner == owner).first()
+    if not repo:
+        repo = Repository(
+            name=repo_name,
+            owner=owner,
+            description=pr_data.get("base", {}).get("repo", {}).get("description") or f"GitHub repository {owner}/{repo_name}"
+        )
+        db.add(repo)
         try:
-            pr_res = http_client.get(pr_url, headers=headers)
-        except Exception as conn_err:
-            raise HTTPException(status_code=503, detail=f"Failed to connect to GitHub API: {conn_err}")
-
-        if pr_res.status_code != 200:
-            error_data = {}
-            try:
-                error_data = pr_res.json()
-            except Exception:
-                pass
-            raise HTTPException(
-                status_code=pr_res.status_code, 
-                detail=f"GitHub API Error: {error_data.get('message', 'Failed to fetch PR')}"
-            )
-        
-        pr_data = pr_res.json()
-
-        # 2. Fetch Pull Request files list
-        files_url = f"https://api.github.com/repos/{owner}/{repo_name}/pulls/{number}/files"
-        try:
-            files_res = http_client.get(files_url, headers=headers)
-            files_data = files_res.json() if files_res.status_code == 200 else []
-        except Exception:
-            files_data = []
-
-        # 3. Create/Retrieve Repository record
-        repo = db.query(Repository).filter(Repository.name == repo_name, Repository.owner == owner).first()
-        if not repo:
-            repo = Repository(
-                name=repo_name,
-                owner=owner,
-                description=pr_data.get("base", {}).get("repo", {}).get("description") or f"GitHub repository {owner}/{repo_name}"
-            )
-            db.add(repo)
-            try:
-                db.commit()
-                db.refresh(repo)
-            except IntegrityError:
-                db.rollback()
-                repo = db.query(Repository).filter(Repository.name == repo_name, Repository.owner == owner).first()
-
-        # 4. Create/Retrieve PullRequest record (upsert handling)
-        pr = db.query(PullRequest).filter(PullRequest.repository_id == repo.id, PullRequest.number == number).first()
-        if not pr:
-            try:
-                pr = PullRequest(
-                    repository_id=repo.id,
-                    number=number,
-                    title=pr_data.get("title", f"Pull Request #{number}"),
-                    source_branch=pr_data.get("head", {}).get("ref", "unknown"),
-                    target_branch=pr_data.get("base", {}).get("ref", "main"),
-                    author=pr_data.get("user", {}).get("login", "unknown"),
-                    status="pending"
-                )
-                db.add(pr)
-                db.commit()
-                db.refresh(pr)
-            except IntegrityError:
-                db.rollback()
-                pr = db.query(PullRequest).filter(PullRequest.repository_id == repo.id, PullRequest.number == number).first()
-                if pr:
-                    pr.title = pr_data.get("title", pr.title)
-                    pr.status = "pending"
-                    db.commit()
-        else:
-            pr.title = pr_data.get("title", pr.title)
-            pr.status = "pending"
             db.commit()
+            db.refresh(repo)
+        except IntegrityError:
+            db.rollback()
+            repo = db.query(Repository).filter(Repository.name == repo_name, Repository.owner == owner).first()
 
-        # Clear existing files for this PR before re-inserting
-        db.query(PRFile).filter(PRFile.pull_request_id == pr.id).delete()
-        db.commit()
-
-        # 5. Process and insert files
-        for f in files_data:
-            filename = f.get("filename")
-            status = f.get("status", "modified")
-            additions = f.get("additions", 0)
-            deletions = f.get("deletions", 0)
-            patch_diff = f.get("patch", "")
-            
-            # Fetch raw content of the file from head branch
-            contents_url = f.get("contents_url")
-            raw_url = f.get("raw_url")
-            file_content = ""
-            if contents_url:
-                raw_headers = {
-                    "Accept": "application/vnd.github.v3.raw",
-                    "User-Agent": "CodePilot-AI-Engine"
-                }
-                if token:
-                    raw_headers["Authorization"] = f"token {token}"
-                try:
-                    contents_res = http_client.get(contents_url, headers=raw_headers)
-                    if contents_res.status_code == 200:
-                        file_content = contents_res.text
-                except Exception as e:
-                    print(f"Error fetching contents_url: {e}")
-
-            if not file_content and raw_url:
-                try:
-                    raw_res = http_client.get(raw_url, follow_redirects=True)
-                    if raw_res.status_code == 200:
-                        file_content = raw_res.text
-                except Exception as e:
-                    print(f"Error fetching raw_url: {e}")
-            if file_content:
-                file_content = file_content.replace("\x00", "")
-
-            pr_file = PRFile(
-                pull_request_id=pr.id,
-                filename=filename,
-                status=status,
-                additions=additions,
-                deletions=deletions,
-                patch_diff=patch_diff,
-                content=file_content
+    # 4. Create/Retrieve PullRequest record (upsert handling)
+    pr = db.query(PullRequest).filter(PullRequest.repository_id == repo.id, PullRequest.number == number).first()
+    if not pr:
+        try:
+            pr = PullRequest(
+                repository_id=repo.id,
+                number=number,
+                title=pr_data.get("title", f"Pull Request #{number}"),
+                source_branch=pr_data.get("head", {}).get("ref", "unknown"),
+                target_branch=pr_data.get("base", {}).get("ref", "main"),
+                author=pr_data.get("user", {}).get("login", "unknown"),
+                status="pending"
             )
-            db.add(pr_file)
-        
+            db.add(pr)
+            db.commit()
+            db.refresh(pr)
+        except IntegrityError:
+            db.rollback()
+            pr = db.query(PullRequest).filter(PullRequest.repository_id == repo.id, PullRequest.number == number).first()
+            if pr:
+                pr.title = pr_data.get("title", pr.title)
+                pr.status = "pending"
+                db.commit()
+    else:
+        pr.title = pr_data.get("title", pr.title)
+        pr.status = "pending"
         db.commit()
-        db.refresh(pr)
-        return pr
+
+    # Clear existing files for this PR before re-inserting
+    db.query(PRFile).filter(PRFile.pull_request_id == pr.id).delete()
+    db.commit()
+
+    # 5. Process and insert files
+    for f in files_data:
+        filename = f.get("filename")
+        status = f.get("status", "modified")
+        additions = f.get("additions", 0)
+        deletions = f.get("deletions", 0)
+        patch_diff = f.get("patch", "")
+        
+        # Fetch raw content of the file from head branch using contents_url if available
+        contents_url = f.get("contents_url")
+        raw_url = f.get("raw_url")
+        file_content = ""
+        if contents_url:
+            try:
+                contents_res = gh_client.get(contents_url, headers={"Accept": "application/vnd.github.v3.raw"})
+                if contents_res.status_code == 200:
+                    file_content = contents_res.text
+            except Exception as e:
+                print(f"Error fetching contents_url: {e}")
+
+        if not file_content and raw_url:
+            try:
+                raw_res = gh_client.get(raw_url, follow_redirects=True)
+                if raw_res.status_code == 200:
+                    file_content = raw_res.text
+            except Exception as e:
+                print(f"Error fetching raw_url: {e}")
+        if file_content:
+            file_content = file_content.replace("\x00", "")
+
+        pr_file = PRFile(
+            pull_request_id=pr.id,
+            filename=filename,
+            status=status,
+            additions=additions,
+            deletions=deletions,
+            patch_diff=patch_diff,
+            content=file_content
+        )
+        db.add(pr_file)
+    
+    db.commit()
+    db.refresh(pr)
+    return pr
 
 # REST API routes
 
@@ -597,38 +569,33 @@ def accept_issue_fix(issue_id: int, db: Session = Depends(get_db)):
         repo = db.query(Repository).filter(Repository.id == pr.repository_id).first()
         if repo and repo.owner != "codepilot-ai":  # Check it is not mock repository
             import base64
-            headers = {
-                "Accept": "application/vnd.github.v3+json",
-                "Authorization": f"token {token}",
-                "User-Agent": "CodePilot-AI-Engine"
-            }
-            with httpx.Client(timeout=20.0) as http_client:
+            try:
+                gh_client = GitHubClient(token=token)
                 # Get current file sha on the source branch
                 get_url = f"https://api.github.com/repos/{repo.owner}/{repo.name}/contents/{filename}?ref={pr.source_branch}"
-                try:
-                    get_res = http_client.get(get_url, headers=headers)
-                    if get_res.status_code == 200:
-                        file_info = get_res.json()
-                        current_sha = file_info.get("sha")
-                        
-                        # Base64 encode the new content
-                        encoded_content = base64.b64encode(updated_content.encode("utf-8")).decode("utf-8")
-                        
-                        # PUT request to update the file on GitHub
-                        put_url = f"https://api.github.com/repos/{repo.owner}/{repo.name}/contents/{filename}"
-                        put_data = {
-                            "message": f"fix(review): apply AI-suggested fix for {issue.title}",
-                            "content": encoded_content,
-                            "sha": current_sha,
-                            "branch": pr.source_branch
-                        }
-                        put_res = http_client.put(put_url, headers=headers, json=put_data)
-                        if put_res.status_code not in [200, 201]:
-                            print(f"Failed to push commit to GitHub: {put_res.status_code} - {put_res.text}")
-                    else:
-                        print(f"Failed to retrieve file SHA from GitHub: {get_res.status_code} - {get_res.text}")
-                except Exception as e:
-                    print(f"Error executing GitHub commit operation: {e}")
+                get_res = gh_client.get(get_url)
+                if get_res.status_code == 200:
+                    file_info = get_res.json()
+                    current_sha = file_info.get("sha")
+                    
+                    # Base64 encode the new content
+                    encoded_content = base64.b64encode(updated_content.encode("utf-8")).decode("utf-8")
+                    
+                    # PUT request to update the file on GitHub
+                    put_url = f"https://api.github.com/repos/{repo.owner}/{repo.name}/contents/{filename}"
+                    put_data = {
+                        "message": f"fix(review): apply AI-suggested fix for {issue.title}",
+                        "content": encoded_content,
+                        "sha": current_sha,
+                        "branch": pr.source_branch
+                    }
+                    put_res = gh_client.put(put_url, json=put_data)
+                    if put_res.status_code not in [200, 201]:
+                        print(f"Failed to push commit to GitHub: {put_res.status_code} - {put_res.text}")
+                else:
+                    print(f"Failed to retrieve file SHA from GitHub: {get_res.status_code} - {get_res.text}")
+            except Exception as e:
+                print(f"Error executing GitHub commit operation: {e}")
 
     # Delete resolved issue
     db.delete(issue)

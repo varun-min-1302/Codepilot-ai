@@ -3,14 +3,28 @@ from sqlalchemy.orm import Session
 from database import get_db, Repository, PullRequest, PRFile, SessionLocal
 from ai_engine import trigger_analysis, run_actual_review_engine
 import json
+import os
+from typing import Optional
 
-def run_actual_review_engine_task(pr_id: int):
+def run_actual_review_engine_task(pr_id: int, token: Optional[str] = None):
     """
     Background task wrapper that initializes its own database session,
     runs the review engine, and safely closes the session.
+    If files list is missing in DB for a real PR, trigger onboard_github_pr first in the background.
     """
     db = SessionLocal()
     try:
+        # Check if files list is missing for a real PR
+        pr = db.query(PullRequest).filter(PullRequest.id == pr_id).first()
+        if pr:
+            repo = db.query(Repository).filter(Repository.id == pr.repository_id).first()
+            if repo and repo.owner != "codepilot-ai":  # Real PR
+                files_count = db.query(PRFile).filter(PRFile.pull_request_id == pr_id).count()
+                if files_count == 0:
+                    print(f"Files list is missing in DB for real PR {pr_id}. Fetching files first.")
+                    from routes import onboard_github_pr
+                    onboard_github_pr(repo.owner, repo.name, pr.number, db, token=token)
+        
         run_actual_review_engine(db, pr_id)
     except Exception as e:
         db.rollback()
@@ -150,8 +164,9 @@ async def github_webhook(
             db.refresh(pr)
             
             # Start background review task
+            token = request.headers.get("x-github-token") or os.getenv("GITHUB_TOKEN")
             trigger_analysis(db, pr.id)
-            background_tasks.add_task(run_actual_review_engine_task, pr.id)
+            background_tasks.add_task(run_actual_review_engine_task, pr.id, token)
             
             return {"message": "Webhook received. AI analysis scheduled.", "pr_id": pr.id}
             

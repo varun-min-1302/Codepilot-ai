@@ -52,6 +52,26 @@ export default function Dashboard() {
   const [onboardInput, setOnboardInput] = useState("");
   const [onboarding, setOnboarding] = useState(false);
 
+  // Toast notifications state
+  const [toast, setToast] = useState<{ message: string; type: "success" | "error" | "info"; visible: boolean }>({
+    message: "",
+    type: "info",
+    visible: false
+  });
+
+  const showToast = (message: string, type: "success" | "error" | "info" = "info") => {
+    setToast({ message, type, visible: true });
+  };
+
+  useEffect(() => {
+    if (toast.visible) {
+      const timer = setTimeout(() => {
+        setToast((prev) => ({ ...prev, visible: false }));
+      }, 4000);
+      return () => clearTimeout(timer);
+    }
+  }, [toast.visible]);
+
   // Fetch all dashboard data
   const fetchDashboardData = async () => {
     try {
@@ -148,9 +168,12 @@ export default function Dashboard() {
 
       // success handling
       setOnboardInput("");
+      showToast("PR successfully onboarded!", "success");
       await fetchDashboardData();
       if (data && data.pr_id) {
-        window.location.href = `/pr/${data.pr_id}`;
+        setTimeout(() => {
+          window.location.href = `/pr/${data.pr_id}`;
+        }, 1500);
       }
     } catch (error: any) {
       console.error(error);
@@ -161,9 +184,8 @@ export default function Dashboard() {
         error.message?.includes("Failed to fetch") || 
         error.message?.includes("fetch failed");
 
-      alert(
-        isNetworkError ? "Backend server is unreachable." : (error.message || "Backend server is unreachable.")
-      );
+      const errorMessage = isNetworkError ? "Backend server is unreachable." : (error.message || "Backend server is unreachable.");
+      showToast(errorMessage, "error");
     } finally {
       setOnboarding(false);
     }
@@ -525,6 +547,33 @@ export default function Dashboard() {
       </div>
 
       <SystemDesignModal isOpen={modalOpen} onClose={() => setModalOpen(false)} />
+
+      {/* Toast Notification */}
+      {toast.visible && (
+        <div className="fixed bottom-5 right-5 z-50 flex items-center gap-3 px-4 py-3.5 rounded-xl border bg-zinc-950/80 backdrop-blur-md shadow-2xl transition-all duration-300 border-zinc-800 max-w-sm animate-in fade-in slide-in-from-bottom-5">
+          <div className="flex-shrink-0">
+            {toast.type === "success" ? (
+              <CheckCircle2 className="w-5 h-5 text-emerald-400" />
+            ) : toast.type === "error" ? (
+              <ShieldAlert className="w-5 h-5 text-red-400" />
+            ) : (
+              <Cpu className="w-5 h-5 text-indigo-400" />
+            )}
+          </div>
+          <div className="flex-grow flex flex-col gap-0.5">
+            <span className="text-[10px] font-mono font-bold tracking-wide uppercase text-zinc-500">
+              {toast.type === "success" ? "Success" : toast.type === "error" ? "System Error" : "Notification"}
+            </span>
+            <span className="text-xs text-zinc-200 font-medium leading-normal">{toast.message}</span>
+          </div>
+          <button 
+            onClick={() => setToast((prev) => ({ ...prev, visible: false }))}
+            className="text-zinc-500 hover:text-zinc-300 transition-colors text-xs font-mono p-1 ml-2"
+          >
+            ×
+          </button>
+        </div>
+      )}
     </div>
   );
 }
