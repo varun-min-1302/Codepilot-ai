@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Sidebar from "@/components/Sidebar";
 import Navbar from "@/components/Navbar";
+import { API_URL } from "@/lib/api";
 import SystemDesignModal from "@/components/SystemDesignModal";
 import { 
   GitPullRequest, 
@@ -54,15 +55,15 @@ export default function Dashboard() {
   // Fetch all dashboard data
   const fetchDashboardData = async () => {
     try {
-      const reposRes = await fetch("http://localhost:8000/api/repos");
+      const reposRes = await fetch(`${API_URL}/api/repos`);
       const reposData = await reposRes.json();
       setRepos(reposData);
 
-      const prsRes = await fetch("http://localhost:8000/api/prs/recent");
+      const prsRes = await fetch(`${API_URL}/api/prs/recent`);
       const prsData = await prsRes.json();
       setPrs(prsData);
 
-      const analyticsRes = await fetch("http://localhost:8000/api/analytics");
+      const analyticsRes = await fetch(`${API_URL}/api/analytics`);
       const analyticsData = await analyticsRes.json();
       setAnalytics(analyticsData);
 
@@ -128,23 +129,41 @@ export default function Dashboard() {
     
     setOnboarding(true);
     try {
-      const res = await fetch("http://localhost:8000/api/prs/onboard", {
+      const response = await fetch(`${API_URL}/api/prs/onboard`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url: onboardInput.trim() })
       });
-      if (res.ok) {
-        const data = await res.json();
-        setOnboardInput("");
-        await fetchDashboardData();
-        if (data.pr_id) {
-          window.location.href = `/pr/${data.pr_id}`;
-        }
-      } else {
-        alert("Failed to onboard PR. Check formatting or token configuration.");
+
+      let data: any = null;
+      try {
+        data = await response.json();
+      } catch (jsonErr) {
+        console.error("Failed to parse JSON response:", jsonErr);
       }
-    } catch {
-      alert("Demo: Failed to onboard. Backend not reachable.");
+
+      if (!response.ok) {
+        throw new Error((data && data.detail) || "Failed to onboard PR");
+      }
+
+      // success handling
+      setOnboardInput("");
+      await fetchDashboardData();
+      if (data && data.pr_id) {
+        window.location.href = `/pr/${data.pr_id}`;
+      }
+    } catch (error: any) {
+      console.error(error);
+      
+      const isNetworkError = 
+        error instanceof TypeError || 
+        error.name === "TypeError" || 
+        error.message?.includes("Failed to fetch") || 
+        error.message?.includes("fetch failed");
+
+      alert(
+        isNetworkError ? "Backend server is unreachable." : (error.message || "Backend server is unreachable.")
+      );
     } finally {
       setOnboarding(false);
     }

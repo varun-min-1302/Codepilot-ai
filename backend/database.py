@@ -1,6 +1,6 @@
 import os
 from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, String, Text, ForeignKey, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, Text, ForeignKey, DateTime, UniqueConstraint
 from sqlalchemy.orm import sessionmaker, relationship, declarative_base
 from dotenv import load_dotenv
 
@@ -34,6 +34,7 @@ class Repository(Base):
 
 class PullRequest(Base):
     __tablename__ = "pull_requests"
+    __table_args__ = (UniqueConstraint("repository_id", "number", name="_repo_pr_uc"),)
     id = Column(Integer, primary_key=True, index=True)
     repository_id = Column(Integer, ForeignKey("repositories.id"))
     number = Column(Integer, index=True)

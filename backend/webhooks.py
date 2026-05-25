@@ -1,8 +1,22 @@
 from fastapi import APIRouter, Depends, Header, Request, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
-from database import get_db, Repository, PullRequest, PRFile
+from database import get_db, Repository, PullRequest, PRFile, SessionLocal
 from ai_engine import trigger_analysis, run_actual_review_engine
 import json
+
+def run_actual_review_engine_task(pr_id: int):
+    """
+    Background task wrapper that initializes its own database session,
+    runs the review engine, and safely closes the session.
+    """
+    db = SessionLocal()
+    try:
+        run_actual_review_engine(db, pr_id)
+    except Exception as e:
+        db.rollback()
+        print(f"Error in background review task: {e}")
+    finally:
+        db.close()
 
 router = APIRouter(prefix="/api/webhooks", tags=["webhooks"])
 
@@ -94,11 +108,16 @@ async def github_webhook(
             repo_data = payload.get("repository", {})
             
             # Upsert Repository
-            repo = db.query(Repository).filter(Repository.name == repo_data.get("name")).first()
+            repo_name = repo_data.get("name")
+            repo_owner = repo_data.get("owner", {}).get("login")
+            repo = db.query(Repository).filter(
+                Repository.name == repo_name,
+                Repository.owner == repo_owner
+            ).first()
             if not repo:
                 repo = Repository(
-                    name=repo_data.get("name"),
-                    owner=repo_data.get("owner", {}).get("login"),
+                    name=repo_name,
+                    owner=repo_owner,
                     description=repo_data.get("description")
                 )
                 db.add(repo)
@@ -132,7 +151,7 @@ async def github_webhook(
             
             # Start background review task
             trigger_analysis(db, pr.id)
-            background_tasks.add_task(run_actual_review_engine, db, pr.id)
+            background_tasks.add_task(run_actual_review_engine_task, pr.id)
             
             return {"message": "Webhook received. AI analysis scheduled.", "pr_id": pr.id}
             

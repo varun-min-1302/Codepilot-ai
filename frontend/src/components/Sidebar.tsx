@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
+import { API_URL } from "@/lib/api";
 import { 
   Terminal, 
   GitPullRequest, 
@@ -30,7 +31,7 @@ export default function Sidebar() {
   const handleSimulateWebhook = async () => {
     setIsSimulating(true);
     try {
-      const res = await fetch("http://localhost:8000/api/webhooks/simulate", {
+      const res = await fetch(`${API_URL}/api/webhooks/simulate`, {
         method: "POST",
       });
       const data = await res.json();

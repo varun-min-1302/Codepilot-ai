@@ -3,6 +3,7 @@
 import { useEffect, useState, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { Search, Terminal, BarChart2, Shield, Settings, Play, Home, CornerDownLeft } from "lucide-react";
+import { API_URL } from "@/lib/api";
 import { AnimatePresence, motion } from "framer-motion";
 
 interface CommandItem {
@@ -38,7 +39,7 @@ export default function CommandPalette() {
 
   const triggerSimulation = async () => {
     try {
-      const res = await fetch("http://localhost:8000/api/webhooks/simulate", {
+      const res = await fetch(`${API_URL}/api/webhooks/simulate`, {
         method: "POST",
       });
       const data = await res.json();

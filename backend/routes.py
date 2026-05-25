@@ -4,7 +4,9 @@ import json
 import logging
 import asyncio
 import httpx
+import time
 from datetime import datetime
+from sqlalchemy.exc import IntegrityError
 
 logger = logging.getLogger("uvicorn.error")
 from typing import List, Optional
@@ -86,7 +88,8 @@ def apply_suggestion_patch(original_content: str, patch_diff: str) -> str:
     return original_content
 
 # GitHub PR Fetcher helper
-async def onboard_github_pr(owner: str, repo_name: str, number: int, db: Session) -> PullRequest:
+# GitHub PR Fetcher helper (Synchronous)
+def onboard_github_pr(owner: str, repo_name: str, number: int, db: Session) -> PullRequest:
     token = os.getenv("GITHUB_TOKEN")
     headers = {
         "Accept": "application/vnd.github.v3+json",
@@ -95,22 +98,34 @@ async def onboard_github_pr(owner: str, repo_name: str, number: int, db: Session
     if token:
         headers["Authorization"] = f"token {token}"
 
-    async with httpx.AsyncClient(timeout=20.0) as http_client:
+    with httpx.Client(timeout=20.0) as http_client:
         # 1. Fetch Pull Request metadata
         pr_url = f"https://api.github.com/repos/{owner}/{repo_name}/pulls/{number}"
-        pr_res = await http_client.get(pr_url, headers=headers)
+        try:
+            pr_res = http_client.get(pr_url, headers=headers)
+        except Exception as conn_err:
+            raise HTTPException(status_code=503, detail=f"Failed to connect to GitHub API: {conn_err}")
+
         if pr_res.status_code != 200:
+            error_data = {}
+            try:
+                error_data = pr_res.json()
+            except Exception:
+                pass
             raise HTTPException(
                 status_code=pr_res.status_code, 
-                detail=f"GitHub API Error: {pr_res.json().get('message', 'Failed to fetch PR')}"
+                detail=f"GitHub API Error: {error_data.get('message', 'Failed to fetch PR')}"
             )
         
         pr_data = pr_res.json()
 
         # 2. Fetch Pull Request files list
         files_url = f"https://api.github.com/repos/{owner}/{repo_name}/pulls/{number}/files"
-        files_res = await http_client.get(files_url, headers=headers)
-        files_data = files_res.json() if files_res.status_code == 200 else []
+        try:
+            files_res = http_client.get(files_url, headers=headers)
+            files_data = files_res.json() if files_res.status_code == 200 else []
+        except Exception:
+            files_data = []
 
         # 3. Create/Retrieve Repository record
         repo = db.query(Repository).filter(Repository.name == repo_name, Repository.owner == owner).first()
@@ -121,24 +136,36 @@ async def onboard_github_pr(owner: str, repo_name: str, number: int, db: Session
                 description=pr_data.get("base", {}).get("repo", {}).get("description") or f"GitHub repository {owner}/{repo_name}"
             )
             db.add(repo)
-            db.commit()
-            db.refresh(repo)
+            try:
+                db.commit()
+                db.refresh(repo)
+            except IntegrityError:
+                db.rollback()
+                repo = db.query(Repository).filter(Repository.name == repo_name, Repository.owner == owner).first()
 
-        # 4. Create/Retrieve PullRequest record
+        # 4. Create/Retrieve PullRequest record (upsert handling)
         pr = db.query(PullRequest).filter(PullRequest.repository_id == repo.id, PullRequest.number == number).first()
         if not pr:
-            pr = PullRequest(
-                repository_id=repo.id,
-                number=number,
-                title=pr_data.get("title", f"Pull Request #{number}"),
-                source_branch=pr_data.get("head", {}).get("ref", "unknown"),
-                target_branch=pr_data.get("base", {}).get("ref", "main"),
-                author=pr_data.get("user", {}).get("login", "unknown"),
-                status="pending"
-            )
-            db.add(pr)
-            db.commit()
-            db.refresh(pr)
+            try:
+                pr = PullRequest(
+                    repository_id=repo.id,
+                    number=number,
+                    title=pr_data.get("title", f"Pull Request #{number}"),
+                    source_branch=pr_data.get("head", {}).get("ref", "unknown"),
+                    target_branch=pr_data.get("base", {}).get("ref", "main"),
+                    author=pr_data.get("user", {}).get("login", "unknown"),
+                    status="pending"
+                )
+                db.add(pr)
+                db.commit()
+                db.refresh(pr)
+            except IntegrityError:
+                db.rollback()
+                pr = db.query(PullRequest).filter(PullRequest.repository_id == repo.id, PullRequest.number == number).first()
+                if pr:
+                    pr.title = pr_data.get("title", pr.title)
+                    pr.status = "pending"
+                    db.commit()
         else:
             pr.title = pr_data.get("title", pr.title)
             pr.status = "pending"
@@ -168,7 +195,7 @@ async def onboard_github_pr(owner: str, repo_name: str, number: int, db: Session
                 if token:
                     raw_headers["Authorization"] = f"token {token}"
                 try:
-                    contents_res = await http_client.get(contents_url, headers=raw_headers)
+                    contents_res = http_client.get(contents_url, headers=raw_headers)
                     if contents_res.status_code == 200:
                         file_content = contents_res.text
                 except Exception as e:
@@ -176,7 +203,7 @@ async def onboard_github_pr(owner: str, repo_name: str, number: int, db: Session
 
             if not file_content and raw_url:
                 try:
-                    raw_res = await http_client.get(raw_url, follow_redirects=True)
+                    raw_res = http_client.get(raw_url, follow_redirects=True)
                     if raw_res.status_code == 200:
                         file_content = raw_res.text
                 except Exception as e:
@@ -273,7 +300,7 @@ def parse_github_pr_url(pr_url: str) -> Optional[dict]:
     return None
 
 @router.post("/prs/onboard")
-async def onboard_pr(req: OnboardRequest, db: Session = Depends(get_db)):
+def onboard_pr(req: OnboardRequest, db: Session = Depends(get_db)):
     """
     Onboards a repository pull request using a URL or specific repository parameters.
     """
@@ -299,11 +326,11 @@ async def onboard_pr(req: OnboardRequest, db: Session = Depends(get_db)):
         )
 
     logger.info(f"onboard_pr - onboarding parsed values: owner={owner}, repo={repo}, number={number}")
-    pr = await onboard_github_pr(owner, repo, number, db)
+    pr = onboard_github_pr(owner, repo, number, db)
     return {"message": "PR successfully onboarded", "pr_id": pr.id}
 
 @router.get("/prs/{pr_id}")
-async def get_pull_request_details(pr_id: str, db: Session = Depends(get_db)):
+def get_pull_request_details(pr_id: str, db: Session = Depends(get_db)):
     """
     Returns PR details. Supports dynamic onboarding when the ID contains '--'.
     """
@@ -313,7 +340,7 @@ async def get_pull_request_details(pr_id: str, db: Session = Depends(get_db)):
         try:
             owner, repo_name, num_str = pr_id.split("--")
             number = int(num_str)
-            db_pr = await onboard_github_pr(owner, repo_name, number, db)
+            db_pr = onboard_github_pr(owner, repo_name, number, db)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Failed to onboard PR '{pr_id}': {e}")
     else:
@@ -380,15 +407,15 @@ async def get_pull_request_details(pr_id: str, db: Session = Depends(get_db)):
     }
 
 @router.get("/prs/{pr_id}/review/stream")
-async def stream_review_analysis(pr_id: int, db: Session = Depends(get_db)):
+def stream_review_analysis(pr_id: int, db: Session = Depends(get_db)):
     """
-    Streams analysis progress and triggers the review engine.
+    Streams analysis progress and triggers the review engine synchronously.
     """
     pr = db.query(PullRequest).filter(PullRequest.id == pr_id).first()
     if not pr:
         raise HTTPException(status_code=404, detail="PR not found")
 
-    async def sse_generator():
+    def sse_generator():
         if pr.status == "completed":
             yield f"data: {json.dumps({'step': 'complete', 'message': 'Review already complete! Fetching results...', 'percentage': 100, 'status': 'completed'})}\n\n"
             return
@@ -399,14 +426,15 @@ async def stream_review_analysis(pr_id: int, db: Session = Depends(get_db)):
         # Stream progress steps
         for step_info in SIMULATED_STEPS[:-1]:
             yield f"data: {json.dumps({'step': step_info['step'], 'message': step_info['message'], 'percentage': step_info['percentage'], 'status': 'analyzing'})}\n\n"
-            await asyncio.sleep(1.0)
+            time.sleep(1.0)
 
         # Trigger actual review
         try:
-            await run_actual_review_engine(db, pr_id)
+            run_actual_review_engine(db, pr_id)
             db.refresh(pr)
             yield f"data: {json.dumps({'step': 'finished', 'message': 'Findings compiled successfully. Rendering dashboard...', 'percentage': 100, 'status': 'completed'})}\n\n"
         except Exception as e:
+            db.rollback()
             pr.status = "failed"
             db.commit()
             yield f"data: {json.dumps({'step': 'failed', 'message': f'Analysis failed: {str(e)}', 'percentage': 100, 'status': 'failed'})}\n\n"
@@ -414,7 +442,7 @@ async def stream_review_analysis(pr_id: int, db: Session = Depends(get_db)):
     return StreamingResponse(sse_generator(), media_type="text/event-stream")
 
 @router.post("/prs/{pr_id}/chat")
-async def pr_chat_assistant(pr_id: int, request: ChatRequest, db: Session = Depends(get_db)):
+def pr_chat_assistant(pr_id: int, request: ChatRequest, db: Session = Depends(get_db)):
     """
     Context-aware AI Chat Assistant using OpenAI or falling back to heuristics.
     """
@@ -454,13 +482,14 @@ async def pr_chat_assistant(pr_id: int, request: ChatRequest, db: Session = Depe
 
     if openai_client:
         try:
-            response = await openai_client.chat.completions.create(
+            response = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
                     {"role": "system", "content": context_prompt},
                     {"role": "user", "content": request.message}
                 ],
-                temperature=0.2
+                temperature=0.2,
+                timeout=30.0
             )
             reply = response.choices[0].message.content
             return {
@@ -499,7 +528,6 @@ async def pr_chat_assistant(pr_id: int, request: ChatRequest, db: Session = Depe
                     "created_at": datetime.utcnow().isoformat()
                 }
 
-
     # Fallback heuristic responses
     query = request.message.lower()
     if "sql" in query or "security" in query or "vulnerab" in query:
@@ -527,7 +555,7 @@ async def pr_chat_assistant(pr_id: int, request: ChatRequest, db: Session = Depe
     }
 
 @router.post("/issues/{issue_id}/accept-fix")
-async def accept_issue_fix(issue_id: int, db: Session = Depends(get_db)):
+def accept_issue_fix(issue_id: int, db: Session = Depends(get_db)):
     """
     Applies the issue suggestion diff directly to the file content in the database.
     If it is a real GitHub PR, commits the updated file directly back to GitHub branch.
@@ -537,12 +565,26 @@ async def accept_issue_fix(issue_id: int, db: Session = Depends(get_db)):
     if not issue:
         raise HTTPException(status_code=404, detail="Issue not found")
 
+    # Filename security validation
+    filename = issue.filename
+    if not filename or filename.strip() == "":
+        raise HTTPException(status_code=400, detail="Filename security validation failed: empty path.")
+    if ".." in filename:
+        raise HTTPException(status_code=400, detail="Filename security validation failed: directory traversal check triggered.")
+    if filename.startswith("/") or filename.startswith("\\") or (len(filename) > 1 and filename[1] == ":"):
+        raise HTTPException(status_code=400, detail="Filename security validation failed: absolute paths are forbidden.")
+    if re.search(r'[:*?"<>|]', filename):
+        raise HTTPException(status_code=400, detail="Filename security validation failed: invalid separator or character.")
+
     pr_file = db.query(PRFile).filter(
         PRFile.pull_request_id == issue.pull_request_id,
-        PRFile.filename == issue.filename
+        PRFile.filename == filename
     ).first()
 
-    if not pr_file or not pr_file.content or not issue.suggestion_diff:
+    if not pr_file:
+        raise HTTPException(status_code=400, detail="Filename security validation failed: file not present in PR file changes.")
+
+    if not pr_file.content or not issue.suggestion_diff:
         raise HTTPException(status_code=400, detail="Cannot apply fix: missing code file or suggestion diff.")
 
     updated_content = apply_suggestion_patch(pr_file.content, issue.suggestion_diff)
@@ -560,11 +602,11 @@ async def accept_issue_fix(issue_id: int, db: Session = Depends(get_db)):
                 "Authorization": f"token {token}",
                 "User-Agent": "CodePilot-AI-Engine"
             }
-            async with httpx.AsyncClient(timeout=20.0) as http_client:
+            with httpx.Client(timeout=20.0) as http_client:
                 # Get current file sha on the source branch
-                get_url = f"https://api.github.com/repos/{repo.owner}/{repo.name}/contents/{issue.filename}?ref={pr.source_branch}"
+                get_url = f"https://api.github.com/repos/{repo.owner}/{repo.name}/contents/{filename}?ref={pr.source_branch}"
                 try:
-                    get_res = await http_client.get(get_url, headers=headers)
+                    get_res = http_client.get(get_url, headers=headers)
                     if get_res.status_code == 200:
                         file_info = get_res.json()
                         current_sha = file_info.get("sha")
@@ -573,14 +615,14 @@ async def accept_issue_fix(issue_id: int, db: Session = Depends(get_db)):
                         encoded_content = base64.b64encode(updated_content.encode("utf-8")).decode("utf-8")
                         
                         # PUT request to update the file on GitHub
-                        put_url = f"https://api.github.com/repos/{repo.owner}/{repo.name}/contents/{issue.filename}"
+                        put_url = f"https://api.github.com/repos/{repo.owner}/{repo.name}/contents/{filename}"
                         put_data = {
                             "message": f"fix(review): apply AI-suggested fix for {issue.title}",
                             "content": encoded_content,
                             "sha": current_sha,
                             "branch": pr.source_branch
                         }
-                        put_res = await http_client.put(put_url, headers=headers, json=put_data)
+                        put_res = http_client.put(put_url, headers=headers, json=put_data)
                         if put_res.status_code not in [200, 201]:
                             print(f"Failed to push commit to GitHub: {put_res.status_code} - {put_res.text}")
                     else:

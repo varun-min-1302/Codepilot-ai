@@ -4,6 +4,7 @@ import { useEffect, useState, useRef } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import Sidebar from "@/components/Sidebar";
+import { API_URL } from "@/lib/api";
 import Navbar from "@/components/Navbar";
 import { 
   GitPullRequest, 
@@ -50,7 +51,7 @@ export default function PRReviewPage() {
   // Fetch PR details
   const fetchPRDetails = async () => {
     try {
-      const res = await fetch(`http://localhost:8000/api/prs/${prId}`);
+      const res = await fetch(`${API_URL}/api/prs/${prId}`);
       if (!res.ok) throw new Error("PR not found");
       const data = await res.json();
       setPrDetails(data);
@@ -86,7 +87,7 @@ export default function PRReviewPage() {
   // Start Server-Sent Events (SSE) review stream
   const startReviewStream = () => {
     setIsStreaming(true);
-    const eventSource = new EventSource(`http://localhost:8000/api/prs/${prId}/review/stream`);
+    const eventSource = new EventSource(`${API_URL}/api/prs/${prId}/review/stream`);
     
     eventSource.onmessage = (event) => {
       const data = JSON.parse(event.data);
@@ -255,7 +256,7 @@ export default function PRReviewPage() {
     setChatLoading(true);
 
     try {
-      const res = await fetch(`http://localhost:8000/api/prs/${prId}/chat`, {
+      const res = await fetch(`${API_URL}/api/prs/${prId}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: textToSend }),
@@ -290,7 +291,7 @@ export default function PRReviewPage() {
 
   const handleAcceptFix = async (issueId: number) => {
     try {
-      const res = await fetch(`http://localhost:8000/api/issues/${issueId}/accept-fix`, {
+      const res = await fetch(`${API_URL}/api/issues/${issueId}/accept-fix`, {
         method: "POST"
       });
       if (res.ok) {

@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import Sidebar from "@/components/Sidebar";
 import Navbar from "@/components/Navbar";
 import { BarChart, ShieldAlert, Cpu, Award, Hourglass, HelpCircle } from "lucide-react";
+import { API_URL } from "@/lib/api";
 
 interface AnalyticsData {
   summary: {
@@ -33,7 +34,7 @@ export default function AnalyticsPage() {
   useEffect(() => {
     const fetchAnalytics = async () => {
       try {
-        const res = await fetch("http://localhost:8000/api/analytics");
+        const res = await fetch(`${API_URL}/api/analytics`);
         if (res.ok) {
           const json = await res.json();
           setData(json);

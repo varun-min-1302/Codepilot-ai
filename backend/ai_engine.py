@@ -2,10 +2,11 @@ import os
 import re
 import json
 import asyncio
+import time
 from datetime import datetime
 from sqlalchemy.orm import Session
 from database import PullRequest, PRFile, AIReviewIssue, ReviewSummary
-from openai import AsyncOpenAI
+from openai import OpenAI
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -13,7 +14,7 @@ load_dotenv()
 
 # Initialize OpenAI client if key is configured
 openai_api_key = os.getenv("OPENAI_API_KEY")
-client = AsyncOpenAI(api_key=openai_api_key) if openai_api_key else None
+client = OpenAI(api_key=openai_api_key) if openai_api_key else None
 openai_active = (client is not None)
 
 
@@ -60,7 +61,7 @@ HEURISTIC_TEMPLATES = {
     }
 }
 
-async def analyze_code_via_api(diff_content: str) -> dict:
+def analyze_code_via_api(diff_content: str) -> dict:
     """
     Calls OpenAI Chat Completions API with JSON mode to request a structured review of the diff.
     """
@@ -91,7 +92,7 @@ async def analyze_code_via_api(diff_content: str) -> dict:
     )
 
     try:
-        response = await client.chat.completions.create(
+        response = client.chat.completions.create(
             model="gpt-4o-mini",
             response_format={"type": "json_object"},
             messages=[
@@ -99,10 +100,24 @@ async def analyze_code_via_api(diff_content: str) -> dict:
                 {"role": "user", "content": f"Review this PR git diff:\n\n{diff_content}"}
             ],
             temperature=0.1,
-            timeout=45
+            timeout=45.0
         )
         content = response.choices[0].message.content
-        return json.loads(content)
+        
+        # Safe JSON parsing
+        try:
+            data = json.loads(content)
+            if not isinstance(data, dict):
+                raise ValueError("OpenAI response content is not a JSON dictionary.")
+            if "overall_summary" not in data or "issues" not in data:
+                raise ValueError("AI JSON response is missing critical fields (overall_summary or issues).")
+            if not isinstance(data.get("issues"), list):
+                raise ValueError("AI JSON issues field is not a list.")
+            return data
+        except Exception as json_err:
+            print(f"Malformed OpenAI JSON response: {json_err}. Raw content: {content}")
+            return None
+
     except Exception as e:
         print(f"Error calling OpenAI API: {e}")
         error_msg = str(e)
@@ -110,6 +125,7 @@ async def analyze_code_via_api(diff_content: str) -> dict:
             global openai_active
             openai_active = False
         return None
+
 
 def analyze_code_via_heuristics(files: list) -> dict:
     """
@@ -187,11 +203,23 @@ def analyze_code_via_heuristics(files: list) -> dict:
         "issues": issues
     }
 
-async def run_actual_review_engine(db: Session, pr_id: int):
+def run_actual_review_engine(db: Session, pr_id: int):
     """
     Executes the review process for a PR: combines patches, runs AI audit or fallback, and writes results to the database.
     """
-    pr = db.query(PullRequest).filter(PullRequest.id == pr_id).first()
+    # Database retry logic with exponential backoff for Neon cold-starts
+    pr = None
+    for attempt in range(4):
+        try:
+            pr = db.query(PullRequest).filter(PullRequest.id == pr_id).first()
+            break
+        except Exception as db_err:
+            print(f"Database query attempt {attempt + 1} failed (Neon cold start?): {db_err}")
+            db.rollback()
+            if attempt == 3:
+                raise db_err
+            time.sleep(2 ** attempt)
+
     if not pr:
         return
 
@@ -206,41 +234,46 @@ async def run_actual_review_engine(db: Session, pr_id: int):
     
     api_result = None
     if client and combined_diff.strip():
-        api_result = await analyze_code_via_api(combined_diff)
+        api_result = analyze_code_via_api(combined_diff)
 
     if not api_result:
         # Fallback to local heuristics
         api_result = analyze_code_via_heuristics(files)
 
-    # Save results to DB
-    # Clear old results
-    db.query(AIReviewIssue).filter(AIReviewIssue.pull_request_id == pr_id).delete()
-    db.query(ReviewSummary).filter(ReviewSummary.pull_request_id == pr_id).delete()
+    try:
+        # Save results to DB
+        # Clear old results
+        db.query(AIReviewIssue).filter(AIReviewIssue.pull_request_id == pr_id).delete()
+        db.query(ReviewSummary).filter(ReviewSummary.pull_request_id == pr_id).delete()
 
-    for issue_data in api_result.get("issues", []):
-        issue = AIReviewIssue(
+        for issue_data in api_result.get("issues", []):
+            issue = AIReviewIssue(
+                pull_request_id=pr_id,
+                filename=issue_data.get("filename"),
+                line_number=issue_data.get("line_number", 1),
+                severity=issue_data.get("severity", "medium"),
+                category=issue_data.get("category", "maintainability"),
+                title=issue_data.get("title", "Review Finding"),
+                description=issue_data.get("description", ""),
+                suggestion_diff=issue_data.get("suggestion_diff")
+            )
+            db.add(issue)
+
+        summary = ReviewSummary(
             pull_request_id=pr_id,
-            filename=issue_data.get("filename"),
-            line_number=issue_data.get("line_number", 1),
-            severity=issue_data.get("severity", "medium"),
-            category=issue_data.get("category", "maintainability"),
-            title=issue_data.get("title", "Review Finding"),
-            description=issue_data.get("description", ""),
-            suggestion_diff=issue_data.get("suggestion_diff")
+            overall_summary=api_result.get("overall_summary", "Review complete."),
+            security_score=api_result.get("security_score", 100),
+            performance_score=api_result.get("performance_score", 100),
+            best_practice_score=api_result.get("best_practice_score", 100)
         )
-        db.add(issue)
-
-    summary = ReviewSummary(
-        pull_request_id=pr_id,
-        overall_summary=api_result.get("overall_summary", "Review complete."),
-        security_score=api_result.get("security_score", 100),
-        performance_score=api_result.get("performance_score", 100),
-        best_practice_score=api_result.get("best_practice_score", 100)
-    )
-    db.add(summary)
-    
-    pr.status = "completed"
-    db.commit()
+        db.add(summary)
+        
+        pr.status = "completed"
+        db.commit()
+    except Exception as db_err:
+        db.rollback()
+        print(f"Error executing database write operations in review engine: {db_err}")
+        raise db_err
 
 def trigger_analysis(db: Session, pr_id: int):
     """
