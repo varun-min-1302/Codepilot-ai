@@ -1,8 +1,12 @@
 import os
+import re
 import json
+import logging
 import asyncio
 import httpx
 from datetime import datetime
+
+logger = logging.getLogger("uvicorn.error")
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -26,6 +30,7 @@ class ChatRequest(BaseModel):
 
 class OnboardRequest(BaseModel):
     url: Optional[str] = None
+    pr_url: Optional[str] = None
     owner: Optional[str] = None
     repo: Optional[str] = None
     number: Optional[int] = None
@@ -249,31 +254,51 @@ def list_recent_pull_requests(db: Session = Depends(get_db)):
         })
     return results
 
+def parse_github_pr_url(pr_url: str) -> Optional[dict]:
+    if not pr_url:
+        return None
+    pattern = r"https://github\.com/([^/]+)/([^/]+)/pull/(\d+)"
+    match = re.match(pattern, pr_url.strip())
+    if match:
+        owner = match.group(1)
+        repo = match.group(2)
+        pr_number = int(match.group(3))
+        logger.info(f"parse_github_pr_url - parsed values: owner={owner}, repo={repo}, pr_number={pr_number}")
+        return {
+            "owner": owner,
+            "repo": repo,
+            "pr_number": pr_number
+        }
+    logger.warning(f"parse_github_pr_url - failed to parse: {pr_url}")
+    return None
+
 @router.post("/prs/onboard")
 async def onboard_pr(req: OnboardRequest, db: Session = Depends(get_db)):
     """
     Onboards a repository pull request using a URL or specific repository parameters.
     """
     owner, repo, number = None, None, None
-    if req.url:
-        # Try parsing Github PR URL: https://github.com/owner/repo/pull/number
-        url = req.url.strip()
-        parts = url.replace("https://", "").replace("http://", "").split("/")
-        if "github.com" in parts[0] and "pull" in parts:
-            try:
-                owner = parts[1]
-                repo = parts[2]
-                number = int(parts[parts.index("pull") + 1].split("?")[0])
-            except Exception:
-                raise HTTPException(status_code=400, detail="Invalid GitHub Pull Request URL structure.")
+    pr_url = req.pr_url or req.url
+    
+    if pr_url:
+        parsed = parse_github_pr_url(pr_url)
+        if not parsed:
+            raise HTTPException(status_code=400, detail="Invalid GitHub PR URL")
+        owner = parsed["owner"]
+        repo = parsed["repo"]
+        number = parsed["pr_number"]
     else:
         owner = req.owner
         repo = req.repo
         number = req.number
 
     if not owner or not repo or not number:
-        raise HTTPException(status_code=400, detail="Must supply either a valid GitHub PR URL or owner, repo, and PR number.")
+        raise HTTPException(
+            status_code=400, 
+            detail="Must supply either a valid GitHub PR URL or owner, repo, and PR number."
+        )
 
+    logger.info(f"onboard_pr - onboarding parsed values: owner={owner}, repo={repo}, number={number}")
     pr = await onboard_github_pr(owner, repo, number, db)
     return {"message": "PR successfully onboarded", "pr_id": pr.id}
 
