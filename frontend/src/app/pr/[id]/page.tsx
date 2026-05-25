@@ -288,6 +288,87 @@ export default function PRReviewPage() {
     }
   };
 
+  const handleAcceptFix = async (issueId: number) => {
+    try {
+      const res = await fetch(`http://localhost:8000/api/issues/${issueId}/accept-fix`, {
+        method: "POST"
+      });
+      if (res.ok) {
+        await fetchPRDetails();
+      } else {
+        alert("Failed to apply the fix suggestion to the database cached file.");
+      }
+    } catch (err) {
+      console.error("Accept fix error:", err);
+      // Fallback local simulation for offline presentation
+      setPrDetails((prev: any) => {
+        if (!prev) return null;
+        const remainingIssues = prev.issues.filter((i: any) => i.id !== issueId);
+        
+        // Find the issue and patch its file content in state
+        const targetIssue = prev.issues.find((i: any) => i.id === issueId);
+        let updatedFiles = prev.files;
+        if (targetIssue) {
+          updatedFiles = prev.files.map((f: any) => {
+            if (f.filename === targetIssue.filename && f.content && targetIssue.suggestion_diff) {
+              const patchedContent = applySuggestionPatchLocal(f.content, targetIssue.suggestion_diff);
+              
+              // If we are currently viewing this file, update selectedFile too
+              if (selectedFile && selectedFile.filename === f.filename) {
+                setTimeout(() => setSelectedFile({ ...selectedFile, content: patchedContent }), 0);
+              }
+              return { ...f, content: patchedContent };
+            }
+            return f;
+          });
+        }
+
+        const sec_count = remainingIssues.filter((i: any) => i.category === "security").length;
+        const perf_count = remainingIssues.filter((i: any) => i.category === "performance").length;
+        const best_count = remainingIssues.filter((i: any) => i.category !== "security" && i.category !== "performance").length;
+
+        const newSummary = prev.summary ? {
+          ...prev.summary,
+          security_score: Math.max(38, 100 - sec_count * 30),
+          performance_score: Math.max(64, 100 - perf_count * 20),
+          best_practice_score: Math.max(78, 100 - best_count * 10),
+          overall_summary: remainingIssues.length === 0 
+            ? "All code review issues have been successfully resolved and applied!" 
+            : prev.summary.overall_summary
+        } : null;
+
+        return {
+          ...prev,
+          issues: remainingIssues,
+          files: updatedFiles,
+          summary: newSummary
+        };
+      });
+    }
+  };
+
+  const applySuggestionPatchLocal = (originalContent: string, patchDiff: string): string => {
+    if (!originalContent || !patchDiff) return originalContent || "";
+    const lines = originalContent.split("\n");
+    const patchLines = patchDiff.split("\n");
+    const minusLines: string[] = [];
+    const plusLines: string[] = [];
+    for (const pl of patchLines) {
+      if (pl.startsWith("@@")) continue;
+      if (pl.startsWith("-")) {
+        minusLines.push(pl.slice(1));
+      } else if (pl.startsWith("+")) {
+        plusLines.push(pl.slice(1));
+      }
+    }
+    const oldText = minusLines.join("\n").trim();
+    const newText = plusLines.join("\n").trim();
+    if (originalContent.includes(oldText)) {
+      return originalContent.replace(oldText, newText);
+    }
+    return originalContent;
+  };
+
   const getSeverityColor = (sev: string) => {
     switch (sev) {
       case "critical": return "bg-red-500/10 text-red-400 border-red-500/20";
@@ -536,7 +617,7 @@ export default function PRReviewPage() {
                                   })}
                                 </div>
                                 <div className="flex items-center gap-2 mt-1">
-                                  <button onClick={() => alert("Fix accepted. Resolving and committing changes back to GitHub branch...")}
+                                  <button onClick={() => handleAcceptFix(issue.id)}
                                     className="h-7 px-3 bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 hover:border-zinc-700 text-zinc-300 rounded text-[10px] font-semibold flex items-center gap-1.5 transition-colors font-sans">
                                     Accept Fix Suggestion
                                   </button>

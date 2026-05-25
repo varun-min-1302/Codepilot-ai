@@ -93,10 +93,6 @@ export default function Sidebar() {
 
         {/* Simulator Panel */}
         <div className="mt-4 p-3 rounded-lg border border-zinc-900 bg-zinc-950/40 flex flex-col gap-2.5">
-          <div className="flex items-center gap-1.5 text-[10px] font-mono text-zinc-400">
-            <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-pulse" />
-            <span>Hackathon Demo Mode</span>
-          </div>
           <p className="text-[10px] text-zinc-500 leading-normal">
             Simulate a realistic GitHub pull request webhook trigger for the Authentication Service repo.
           </p>
